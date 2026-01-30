@@ -38,29 +38,33 @@ class OpenAIStub(FastAPI):
         async def get_model_info(model_id: str):
             return self.model_info(model_id)
 
-    def register_model(self, name: str, model: str = None) -> None:
-        self.models[name] = model if model else name
+    def register_model(self, name: str, model: str = None, model_type: str = None) -> None:
+        self.models[name] = {"model": model if model else name, "type": model_type}
 
     def deregister_model(self, name: str) -> None:
         if name in self.models:
             del self.models[name]
 
     def model_info(self, model: str) -> dict:
+        model_data = self.models.get(model, {})
+        model_type = model_data.get("type") if isinstance(model_data, dict) else None
         result = {
             "id": model,
             "object": "model",
             "created": 0,
-            "owned_by": "user"
+            "owned_by": "system"
         }
+        if model_type:
+            result["type"] = model_type
         return result
 
     def model_list(self) -> dict:
         if not self.models:
             return {}
-        
+
         result = {
             "object": "list",
-            "data": [ self.model_info(model) for model in list(set(self.models.keys() | self.models.values())) if model ]
+            "data": [ self.model_info(model) for model in self.models.keys() ]
         }
 
         return result

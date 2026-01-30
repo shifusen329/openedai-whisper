@@ -14,12 +14,12 @@ services:
       - "8000:8000"
     volumes:
       - ./hf_home:/app/hf_home
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
+#    runtime: nvidia
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
               #device_ids: ['0', '1'] # Select a gpu, or
-              count: all
-              capabilities: [gpu]
+#              count: all
+#              capabilities: [gpu]
