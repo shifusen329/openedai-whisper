@@ -22,30 +22,32 @@ API Compatibility:
 
 Parameter Support:
 - [X] `file`
-- [X] `model` (only whisper-1 exists, so this is ignored)
+- [X] `model` (all whisper / distil-whisper sizes; see list below)
 - [X] `language`
-- [ ] `prompt` (not yet supported)
+- [X] `prompt` (passed as `initial_prompt` to faster-whisper)
 - [X] `temperature`
 - [X] `response_format`:
 - - [X] `json`
 - - [X] `text`
 - - [X] `srt`
 - - [X] `vtt`
-- - [X] `verbose_json` *(partial support, some fields missing)
+- - [X] `verbose_json`
 
 Details:
-* CUDA or CPU support (automatically detected)
-* float32, float16 or bfloat16 support (automatically detected)
+* Backend: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2). No PyTorch dependency.
+* CUDA or CPU support (automatically detected).
+* Compute type auto-selected from `bfloat16` / `float16` / `int8` / `float32` based on device capabilities; override with `-t`.
+* **Silero VAD is enabled by default** to suppress hallucinations during silence and non-speech. Set `WHISPER_VAD=0` to disable.
+* `condition_on_previous_text` defaults to **off** to avoid repetition-loop hallucinations. Set `WHISPER_CONDITION_PREV=1` to restore faster-whisper's upstream default.
 
-Tested whisper models:
-* openai/whisper-large-v2 (the default)
-* openai/whisper-large-v3
-* distil-whisper/distil-medium.en
-* openai/whisper-tiny.en
-* ...
+Supported models (public names preserved from the previous HF-transformers backend; mapped internally to faster-whisper ids):
+* `openai/whisper-{tiny,base,small,medium,large,large-v2,large-v3,large-v3-turbo}` and their `.en` variants
+* `distil-whisper/distil-{small.en,medium.en,large-v2,large-v3}`
+* Raw faster-whisper ids (`large-v3`, `distil-large-v3`, ...), `Systran/faster-whisper-*` HF repos, and local CT2 model paths are also accepted via `-m`.
 
+Default model: `openai/whisper-large-v2`.
 
-Version: 0.1.0, Last update: 2024-03-15
+Version: 0.2.0, Last update: 2026-04-21
 
 
 API Documentation
@@ -61,12 +63,12 @@ API Documentation
 Installation instructions
 -------------------------
 
-You will need to install CUDA for your operating system if you want to use CUDA.
+You will need a recent NVIDIA driver (>= 525, supporting CUDA 12) for GPU inference. Faster-whisper wheels on PyPI bundle the required CTranslate2 CUDA libraries; you don't need a full CUDA toolkit install.
 
 ```shell
 # Install the Python requirements
 pip install -r requirements.txt
-# install ffmpeg
+# ffmpeg is optional (PyAV bundles decoders) but harmless to install
 sudo apt install ffmpeg
 ```
 
@@ -86,9 +88,10 @@ Options:
                       The model to use for transcription.
                       Ex. distil-whisper/distil-medium.en (default: openai/whisper-large-v2)
 -d DEVICE, --device DEVICE
-                      Set the torch device for the model. Ex. cuda:1 (default: auto)
+                      Device for inference: auto, cuda, or cpu (default: auto)
+--device-index INDEX  CUDA device index when device=cuda (default: 0)
 -t DTYPE, --dtype DTYPE
-                      Set the torch data type for processing (float32, float16, bfloat16) (default: auto)
+                      Compute type: auto, float32, float16, bfloat16, int8, int8_float16 (default: auto)
 -P PORT, --port PORT  Server tcp port (default: 8000)
 -H HOST, --host HOST  Host to listen on, Ex. 0.0.0.0 (default: localhost)
 --preload             Preload model and exit. (default: False)

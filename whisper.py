@@ -2,20 +2,26 @@
 import os
 import sys
 import argparse
+import asyncio
+import json
 import logging
 import time
 import threading
+import gc
+import io
 
-import torch
-from transformers import pipeline
+import numpy as np
+import ctranslate2
+from faster_whisper import WhisperModel
+from faster_whisper.vad import get_speech_timestamps, VadOptions
 from typing import Optional, List
-from fastapi import UploadFile, Form
+from fastapi import UploadFile, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, JSONResponse
 import uvicorn
 
 import openedai
 
-pipe = None
+model = None
 last_usage_time = None
 model_config = None
 unload_timer = None
@@ -29,7 +35,22 @@ LAZY_LOAD = True
 # Seconds of inactivity before unloading the model (0 to disable unloading)
 UNLOAD_TIMEOUT = 300
 
-# Available whisper models
+# Silero VAD is on by default to suppress silence hallucinations. Set WHISPER_VAD=0 to disable.
+VAD_FILTER_DEFAULT = os.environ.get("WHISPER_VAD", "1") != "0"
+# Disable condition_on_previous_text by default to prevent repetition-loop hallucinations.
+# Set WHISPER_CONDITION_PREV=1 to restore faster-whisper's upstream default.
+CONDITION_PREV_DEFAULT = os.environ.get("WHISPER_CONDITION_PREV", "0") == "1"
+
+_transcribe_lock = threading.Lock()
+
+# WebSocket streaming defaults (Deepgram-shape /v1/listen)
+WS_SAMPLE_RATE = 16000
+WS_VAD_MIN_SILENCE_MS = 500     # silence gap that closes a speech segment
+WS_VAD_CHECK_EVERY_MS = 250     # how often to re-evaluate the buffer
+WS_MAX_BUFFER_SECONDS = 30      # safety cap on retained audio
+WS_MIN_SEGMENT_MS = 200         # ignore VAD blips shorter than this
+
+# Available whisper models (public names; mapped internally to faster-whisper ids)
 AVAILABLE_MODELS = [
     "openai/whisper-tiny",
     "openai/whisper-tiny.en",
@@ -49,6 +70,29 @@ AVAILABLE_MODELS = [
     "distil-whisper/distil-large-v3",
 ]
 
+# Map public HF-style names to faster-whisper model identifiers
+FW_MODEL_MAP = {
+    "openai/whisper-tiny": "tiny",
+    "openai/whisper-tiny.en": "tiny.en",
+    "openai/whisper-base": "base",
+    "openai/whisper-base.en": "base.en",
+    "openai/whisper-small": "small",
+    "openai/whisper-small.en": "small.en",
+    "openai/whisper-medium": "medium",
+    "openai/whisper-medium.en": "medium.en",
+    "openai/whisper-large": "large-v1",
+    "openai/whisper-large-v2": "large-v2",
+    "openai/whisper-large-v3": "large-v3",
+    "openai/whisper-large-v3-turbo": "large-v3-turbo",
+    "distil-whisper/distil-small.en": "distil-small.en",
+    "distil-whisper/distil-medium.en": "distil-medium.en",
+    "distil-whisper/distil-large-v2": "distil-large-v2",
+    "distil-whisper/distil-large-v3": "distil-large-v3",
+}
+
+# Distil models are English-only but lack the .en suffix
+EN_ONLY_EXTRA = {"distil-large-v2", "distil-large-v3"}
+
 # Available TTS models (served by chatterbox-api or voxcpm)
 TTS_MODELS = [
     "chatterbox",
@@ -60,48 +104,63 @@ TTS_MODELS = [
 default_model = None
 
 def unload_model():
-    global pipe, last_usage_time, unload_timer, current_model_name
-    if pipe is not None and last_usage_time is not None:
+    global model, last_usage_time, unload_timer, current_model_name
+    if model is not None and last_usage_time is not None:
         if time.time() - last_usage_time >= UNLOAD_TIMEOUT:
             logging.info("Unloading model due to inactivity")
-            pipe.model = pipe.model.to('cpu')
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            pipe = None
+            model = None
+            gc.collect()
             last_usage_time = None
             unload_timer = None
             current_model_name = None
             return
-    
+
     # Schedule next check
     unload_timer = threading.Timer(30.0, unload_model)
     unload_timer.daemon = True
     unload_timer.start()
 
+def resolve_model_name(model_name: str) -> str:
+    """Resolve short model names to the project's public HF-style name."""
+    if not model_name or model_name == "whisper-1":
+        return default_model
+    if "/" in model_name:
+        return model_name
+    full_name = f"openai/{model_name}"
+    if full_name in AVAILABLE_MODELS:
+        return full_name
+    full_name = f"distil-whisper/{model_name}"
+    if full_name in AVAILABLE_MODELS:
+        return full_name
+    return model_name
+
+def to_fw_id(public_name: str) -> str:
+    """Translate a public HF-style name to a faster-whisper model id."""
+    return FW_MODEL_MAP.get(public_name, public_name)
+
+def is_english_only_fw(fw_id: str) -> bool:
+    return fw_id.endswith(".en") or fw_id in EN_ONLY_EXTRA
+
 def ensure_model_loaded(requested_model: str = None):
-    global pipe, last_usage_time, unload_timer, model_config, is_english_only, current_model_name, default_model
+    global model, last_usage_time, unload_timer, model_config, is_english_only, current_model_name, default_model
 
-    # Use requested model, or fall back to default
-    model_name = requested_model if requested_model and requested_model != "whisper-1" else default_model
+    public_name = resolve_model_name(requested_model)
 
-    # Check if we need to load a different model
-    if pipe is not None and current_model_name != model_name:
-        logging.info(f"Switching model from {current_model_name} to {model_name}")
-        pipe.model = pipe.model.to('cpu')
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        pipe = None
+    if model is not None and current_model_name != public_name:
+        logging.info(f"Switching model from {current_model_name} to {public_name}")
+        model = None
+        gc.collect()
 
-    if pipe is None:
-        logging.info(f"Loading model: {model_name}")
-        device, dtype, _ = model_config
-        is_english_only = model_name.endswith('.en')
-        pipe = pipeline("automatic-speech-recognition", model=model_name, device=device, chunk_length_s=30, torch_dtype=dtype)
-        current_model_name = model_name
+    if model is None:
+        fw_id = to_fw_id(public_name)
+        logging.info(f"Loading model: {public_name} (faster-whisper id: {fw_id})")
+        device, compute_type, device_index, _ = model_config
+        is_english_only = is_english_only_fw(fw_id)
+        model = WhisperModel(fw_id, device=device, device_index=device_index, compute_type=compute_type)
+        current_model_name = public_name
 
     last_usage_time = time.time()
 
-    # Start or restart the unload timer (skip if unloading is disabled)
     if UNLOAD_TIMEOUT > 0:
         if unload_timer is not None:
             unload_timer.cancel()
@@ -109,60 +168,141 @@ def ensure_model_loaded(requested_model: str = None):
         unload_timer.daemon = True
         unload_timer.start()
 
-async def whisper(file, response_format: str, **kwargs):
-    global pipe
-    
-    ensure_model_loaded()
-    result = pipe(await file.read(), **kwargs)
+
+def _run_transcribe(audio_bytes: bytes, word_timestamps: bool, fw_kwargs: dict) -> dict:
+    """Run transcription and return a dict compatible with the legacy response builders."""
+    with _transcribe_lock:
+        seg_iter, info = model.transcribe(
+            io.BytesIO(audio_bytes),
+            word_timestamps=word_timestamps,
+            **fw_kwargs,
+        )
+        # segments is a generator; materializing drives inference and populates info.duration
+        segments = list(seg_iter)
+
+    if word_timestamps:
+        chunks = [
+            {"text": w.word, "timestamp": (w.start, w.end)}
+            for s in segments for w in (s.words or [])
+        ]
+    else:
+        chunks = [
+            {"text": s.text, "timestamp": (s.start, s.end)}
+            for s in segments
+        ]
+    text = "".join(s.text for s in segments)
+    return {"text": text, "chunks": chunks, "info": info}
+
+
+def _run_transcribe_array(audio_f32: np.ndarray, fw_kwargs: dict) -> dict:
+    """Like _run_transcribe but accepts a numpy float32 array directly (skips PyAV decode)."""
+    with _transcribe_lock:
+        seg_iter, info = model.transcribe(audio_f32, **fw_kwargs)
+        segments = list(seg_iter)
+
+    chunks = []
+    if fw_kwargs.get("word_timestamps"):
+        for s in segments:
+            for w in (s.words or []):
+                chunks.append({"text": w.word, "start": w.start, "end": w.end})
+    else:
+        for s in segments:
+            chunks.append({"text": s.text, "start": s.start, "end": s.end})
+    text = "".join(s.text for s in segments)
+    return {"text": text, "chunks": chunks, "info": info}
+
+
+def _deepgram_event(text, words, start, duration, is_final=True):
+    """Build a Deepgram-shape Results event matching what OMI's stt_response_schema parses."""
+    return {
+        "type": "Results",
+        "channel_index": [0, 1],
+        "start": start,
+        "duration": duration,
+        "is_final": is_final,
+        "speech_final": is_final,
+        "channel": {
+            "alternatives": [{
+                "transcript": text,
+                "confidence": 1.0,
+                "words": [
+                    {"word": w["text"].strip().lower(),
+                     "punctuated_word": w["text"].strip(),
+                     "start": w["start"],
+                     "end": w["end"],
+                     "speaker": 0,
+                     "confidence": 1.0}
+                    for w in words
+                ],
+            }]
+        },
+    }
+
+
+async def whisper(file, response_format: str, word_timestamps: bool, task: str, fw_kwargs: dict):
+    result = _run_transcribe(await file.read(), word_timestamps, fw_kwargs)
 
     filename_noext, ext = os.path.splitext(file.filename)
+    info = result["info"]
+    chunks = result["chunks"]
 
     if response_format == "text":
         return PlainTextResponse(result["text"].strip(), headers={"Content-Disposition": f"attachment; filename={filename_noext}.txt"})
 
     elif response_format == "json":
         return JSONResponse(content={ 'text': result['text'].strip() }, media_type="application/json", headers={"Content-Disposition": f"attachment; filename={filename_noext}.json"})
-    
-    elif response_format == "verbose_json":
-        chunks = result["chunks"]
 
+    elif response_format == "verbose_json":
+        duration = info.duration if info.duration else (chunks[-1]['timestamp'][1] if chunks else 0.0)
         response = {
-            "task": kwargs['generate_kwargs'].get('task', 'transcribe'),
-            #"language": "english",
-            "duration": chunks[-1]['timestamp'][1],
+            "task": task,
+            "language": info.language,
+            "duration": duration,
             "text": result["text"].strip(),
         }
-        if kwargs['return_timestamps'] == 'word':
-            response['words'] = [{'word': chunk['text'].strip(), 'start': chunk['timestamp'][0], 'end': chunk['timestamp'][1] } for chunk in chunks ]
+        if word_timestamps:
+            response['words'] = [{'word': c['text'].strip(), 'start': c['timestamp'][0], 'end': c['timestamp'][1] } for c in chunks ]
         else:
             response['segments'] = [{
                     "id": i,
-                    #"seek": 0,
-                    'start': chunk['timestamp'][0],
-                    'end': chunk['timestamp'][1],
-                    'text': chunk['text'].strip(),
-                    #"tokens": [ ],
-                    #"temperature": 0.0,
-                    #"avg_logprob": -0.2860786020755768,
-                    #"compression_ratio": 1.2363636493682861,
-                    #"no_speech_prob": 0.00985979475080967
-            } for i, chunk in enumerate(chunks) ]
-        
+                    'start': c['timestamp'][0],
+                    'end': c['timestamp'][1],
+                    'text': c['text'].strip(),
+            } for i, c in enumerate(chunks) ]
+
         return JSONResponse(content=response, media_type="application/json", headers={"Content-Disposition": f"attachment; filename={filename_noext}_verbose.json"})
 
     elif response_format == "srt":
             def srt_time(t):
                 return "{:02d}:{:02d}:{:06.3f}".format(int(t//3600), int(t//60)%60, t%60).replace(".", ",")
 
-            return PlainTextResponse("\n".join([ f"{i}\n{srt_time(chunk['timestamp'][0])} --> {srt_time(chunk['timestamp'][1])}\n{chunk['text'].strip()}\n"
-                for i, chunk in enumerate(result["chunks"], 1) ]), media_type="text/srt; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={filename_noext}.srt"})
+            return PlainTextResponse("\n".join([ f"{i}\n{srt_time(c['timestamp'][0])} --> {srt_time(c['timestamp'][1])}\n{c['text'].strip()}\n"
+                for i, c in enumerate(chunks, 1) ]), media_type="text/srt; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={filename_noext}.srt"})
 
     elif response_format == "vtt":
             def vtt_time(t):
                 return "{:02d}:{:06.3f}".format(int(t//60), t%60)
-            
-            return PlainTextResponse("\n".join(["WEBVTT\n"] + [ f"{vtt_time(chunk['timestamp'][0])} --> {vtt_time(chunk['timestamp'][1])}\n{chunk['text'].strip()}\n"
-                for chunk in result["chunks"] ]), media_type="text/vtt; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={filename_noext}.vtt"})
+
+            return PlainTextResponse("\n".join(["WEBVTT\n"] + [ f"{vtt_time(c['timestamp'][0])} --> {vtt_time(c['timestamp'][1])}\n{c['text'].strip()}\n"
+                for c in chunks ]), media_type="text/vtt; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={filename_noext}.vtt"})
+
+
+def _build_fw_kwargs(task, language, prompt, temperature, response_format,
+                     timestamp_granularities, english_only):
+    k = {
+        "task": task,
+        "vad_filter": VAD_FILTER_DEFAULT,
+        "vad_parameters": {"min_silence_duration_ms": 500},
+        "condition_on_previous_text": CONDITION_PREV_DEFAULT,
+        "initial_prompt": prompt or None,
+    }
+    if english_only:
+        k["language"] = "en"
+    elif language:
+        k["language"] = language
+    if temperature is not None:
+        k["temperature"] = temperature
+    return k
 
 
 @app.post("/v1/audio/transcriptions")
@@ -175,30 +315,21 @@ async def transcriptions(
         temperature: Optional[float] = Form(None),
         timestamp_granularities: List[str] = Form(["segment"])
     ):
-    global pipe, is_english_only
+    global is_english_only
 
     ensure_model_loaded(model)
 
-    kwargs = {'generate_kwargs': {}}
-
-    # English-only models don't support task or language parameters
-    if not is_english_only:
-        kwargs['generate_kwargs']['task'] = 'transcribe'
-        if language:
-            kwargs['generate_kwargs']["language"] = language
-# May work soon, https://github.com/huggingface/transformers/issues/27317
-#    if prompt:
-#        kwargs["initial_prompt"] = prompt
-    if temperature:
-        kwargs['generate_kwargs']["temperature"] = temperature
-        kwargs['generate_kwargs']['do_sample'] = True
-
-    if response_format == "verbose_json" and 'word' in timestamp_granularities:
-        kwargs['return_timestamps'] = 'word'
-    else:
-        kwargs['return_timestamps'] = response_format in ["verbose_json", "srt", "vtt"]
-
-    return await whisper(file, response_format, **kwargs)
+    word_timestamps = response_format == "verbose_json" and "word" in timestamp_granularities
+    fw_kwargs = _build_fw_kwargs(
+        task="transcribe",
+        language=language,
+        prompt=prompt,
+        temperature=temperature,
+        response_format=response_format,
+        timestamp_granularities=timestamp_granularities,
+        english_only=is_english_only,
+    )
+    return await whisper(file, response_format, word_timestamps, "transcribe", fw_kwargs)
 
 
 @app.post("/v1/audio/translations")
@@ -209,40 +340,173 @@ async def translations(
         response_format: Optional[str] = Form("json"),
         temperature: Optional[float] = Form(None),
     ):
-    global pipe, is_english_only
+    global is_english_only
 
     ensure_model_loaded(model)
 
-    # English-only models don't support translation (only transcribe)
     if is_english_only:
         return JSONResponse(
             status_code=400,
             content={"error": "Translation is not supported for English-only models"}
         )
 
-    kwargs = {'generate_kwargs': {"task": "translate"}}
+    word_timestamps = False
+    fw_kwargs = _build_fw_kwargs(
+        task="translate",
+        language=None,
+        prompt=prompt,
+        temperature=temperature,
+        response_format=response_format,
+        timestamp_granularities=["segment"],
+        english_only=False,
+    )
+    return await whisper(file, response_format, word_timestamps, "translate", fw_kwargs)
 
-# May work soon, https://github.com/huggingface/transformers/issues/27317
-#    if prompt:
-#        kwargs["initial_prompt"] = prompt
-    if temperature:
-        kwargs['generate_kwargs']["temperature"] = temperature
-        kwargs['generate_kwargs']['do_sample'] = True
 
-    kwargs['return_timestamps'] = response_format in ["verbose_json", "srt", "vtt"]
+@app.websocket("/v1/listen")
+async def listen(websocket: WebSocket):
+    """Deepgram-shape streaming STT. Accepts raw PCM16 mono @ 16kHz binary frames."""
+    qp = websocket.query_params
+    encoding = qp.get("encoding", "linear16")
+    try:
+        sample_rate = int(qp.get("sample_rate", str(WS_SAMPLE_RATE)))
+    except ValueError:
+        sample_rate = -1
+    requested_model = qp.get("model")
+    language = qp.get("language")
+    initial_prompt = qp.get("prompt")
 
-    return await whisper(file, response_format, **kwargs)
+    await websocket.accept()
+
+    if encoding != "linear16" or sample_rate != WS_SAMPLE_RATE:
+        await websocket.send_json({"type": "Error", "message":
+            f"only encoding=linear16, sample_rate={WS_SAMPLE_RATE} supported (got {encoding}, {sample_rate})"})
+        await websocket.close(code=1003)
+        return
+
+    try:
+        ensure_model_loaded(requested_model)
+    except Exception as e:
+        await websocket.send_json({"type": "Error", "message": f"model load failed: {e}"})
+        await websocket.close(code=1011)
+        return
+
+    english_only = is_english_only
+    pcm_buf = bytearray()
+    consumed_samples = 0
+    last_vad_check_samples = 0
+    bytes_per_sample = 2
+
+    vad_opts = VadOptions(min_silence_duration_ms=WS_VAD_MIN_SILENCE_MS,
+                          min_speech_duration_ms=WS_MIN_SEGMENT_MS)
+
+    async def _flush(force_final: bool):
+        nonlocal pcm_buf, consumed_samples, last_vad_check_samples
+        if len(pcm_buf) < int(bytes_per_sample * sample_rate * 0.2):
+            return
+        audio = (np.frombuffer(bytes(pcm_buf), dtype=np.int16)
+                   .astype(np.float32) / 32768.0)
+
+        speech = get_speech_timestamps(audio, vad_opts, sampling_rate=sample_rate)
+        if not speech:
+            keep = int(0.5 * sample_rate) * bytes_per_sample
+            if len(pcm_buf) > keep:
+                consumed_samples += (len(pcm_buf) - keep) // bytes_per_sample
+                del pcm_buf[:-keep]
+            return
+
+        last = speech[-1]
+        tail_silence_samples = len(audio) - last["end"]
+        min_silence_samples = int(WS_VAD_MIN_SILENCE_MS / 1000 * sample_rate)
+        if not force_final and tail_silence_samples < min_silence_samples:
+            return  # current speech still ongoing
+
+        seg_start = speech[0]["start"]
+        seg_end = last["end"]
+        segment = audio[seg_start:seg_end]
+
+        fw_kwargs = {
+            "task": "transcribe",
+            "vad_filter": False,
+            "condition_on_previous_text": CONDITION_PREV_DEFAULT,
+            "initial_prompt": initial_prompt,
+            "word_timestamps": True,
+        }
+        if english_only:
+            fw_kwargs["language"] = "en"
+        elif language:
+            fw_kwargs["language"] = language
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: _run_transcribe_array(segment, fw_kwargs))
+
+        seg_offset_s = (consumed_samples + seg_start) / sample_rate
+        words = [
+            {"text": w["text"], "start": seg_offset_s + w["start"], "end": seg_offset_s + w["end"]}
+            for w in result["chunks"]
+        ]
+        text = result["text"].strip()
+        if text:
+            await websocket.send_json(_deepgram_event(
+                text, words,
+                start=seg_offset_s,
+                duration=(seg_end - seg_start) / sample_rate,
+                is_final=True,
+            ))
+
+        bytes_consumed = seg_end * bytes_per_sample
+        consumed_samples += seg_end
+        del pcm_buf[:bytes_consumed]
+        last_vad_check_samples = 0
+
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if msg.get("bytes") is not None:
+                pcm_buf.extend(msg["bytes"])
+                max_bytes = WS_MAX_BUFFER_SECONDS * sample_rate * bytes_per_sample
+                if len(pcm_buf) > max_bytes:
+                    drop = len(pcm_buf) - max_bytes
+                    consumed_samples += drop // bytes_per_sample
+                    del pcm_buf[:drop]
+                samples_now = len(pcm_buf) // bytes_per_sample
+                check_every_samples = int(WS_VAD_CHECK_EVERY_MS / 1000 * sample_rate)
+                if samples_now - last_vad_check_samples >= check_every_samples:
+                    last_vad_check_samples = samples_now
+                    await _flush(force_final=False)
+            elif msg.get("text") is not None:
+                try:
+                    if json.loads(msg["text"]).get("type") == "CloseStream":
+                        break
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+
+    try:
+        await _flush(force_final=True)
+        await websocket.send_json({"type": "Metadata", "request_id": "n/a"})
+    except Exception:
+        pass
+    try:
+        await websocket.close()
+    except Exception:
+        pass
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog='whisper.py',
-        description='OpenedAI Whisper API Server',
+        description='OpenedAI Whisper API Server (faster-whisper backend)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('-m', '--model', action='store', default="openai/whisper-large-v2", help="The model to use for transcription. Ex. distil-whisper/distil-medium.en")
-    parser.add_argument('-d', '--device', action='store', default="auto", help="Set the torch device for the model. Ex. cuda:1")
-    parser.add_argument('-t', '--dtype', action='store', default="auto", help="Set the torch data type for processing (float32, float16, bfloat16)")
+    parser.add_argument('-m', '--model', action='store', default="openai/whisper-large-v2", help="The model to use. Accepts HF-style names (openai/whisper-large-v2), short names (whisper-large-v2), raw faster-whisper ids (large-v3, distil-large-v3), CT2 HF repos (Systran/faster-whisper-large-v3), or a local path.")
+    parser.add_argument('-d', '--device', action='store', default="auto", help="Device for inference: auto, cuda, or cpu.")
+    parser.add_argument('-t', '--dtype', action='store', default="auto", help="Compute type: auto, float32, float16, bfloat16, int8, int8_float16.")
+    parser.add_argument('--device-index', action='store', default=0, type=int, help="CUDA device index when device=cuda.")
     parser.add_argument('-P', '--port', action='store', default=8000, type=int, help="Server tcp port")
     parser.add_argument('-H', '--host', action='store', default='localhost', help="Host to listen on, Ex. 0.0.0.0")
     parser.add_argument('--preload', action='store_true', help="Preload model and exit.")
@@ -251,29 +515,38 @@ def parse_args(argv=None):
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def _pick_compute_type(device: str, requested: str) -> str:
+    supported = set(ctranslate2.get_supported_compute_types(device))
+    if requested == "auto":
+        for candidate in ("bfloat16", "float16"):
+            if candidate in supported:
+                return candidate
+        if device == "cpu" and "int8" in supported:
+            return "int8"
+        return "float32"
+    if requested in supported:
+        return requested
+    fallback = "float16" if "float16" in supported else "float32"
+    print(f"compute type '{requested}' not supported on {device}; falling back to '{fallback}'", file=sys.stderr)
+    return fallback
+
 if __name__ == "__main__":
     args = parse_args(sys.argv[1:])
 
     if args.device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if args.dtype == "auto":
-        if torch.cuda.is_available():
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        else:
-            dtype = torch.float32
+        device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
     else:
-        dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16 if args.dtype == "float16" else torch.float32
+        device = args.device
 
-        if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
-            print("bfloat16 not supported on this hardware, falling back to float16", file=sys.stderr)
-            dtype = torch.float16
+    compute_type = _pick_compute_type(device, args.dtype)
 
-    model_config = (device, dtype, args.model)
+    model_config = (device, compute_type, args.device_index, args.model)
     default_model = args.model
 
     if args.preload:
-        pipe = pipeline("automatic-speech-recognition", model=args.model, device=device, chunk_length_s=30, torch_dtype=dtype)
+        fw_id = to_fw_id(resolve_model_name(args.model))
+        logging.info(f"Preloading model: {args.model} (faster-whisper id: {fw_id}) on {device} [{compute_type}]")
+        _preload = WhisperModel(fw_id, device=device, device_index=args.device_index, compute_type=compute_type)
         sys.exit(0)
 
     app.register_model('whisper-1', args.model, model_type='stt')
@@ -281,7 +554,6 @@ if __name__ == "__main__":
     # Register all available STT models
     for model_id in AVAILABLE_MODELS:
         app.register_model(model_id, model_type='stt')
-        # Also register without the openai/ prefix as an alias
         if model_id.startswith('openai/'):
             short_name = model_id.replace('openai/', '', 1)
             app.register_model(short_name, model_id, model_type='stt')
