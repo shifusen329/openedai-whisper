@@ -8,6 +8,7 @@ services:
     tty: true
     environment:
       - HF_HOME=/app/hf_home
+      - HF_TOKEN=${HF_TOKEN:-}
     env_file:
       - whisper.env
     ports:

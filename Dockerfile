@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y ffmpeg python-i
 RUN mkdir -p /app
 WORKDIR /app
 COPY requirements.txt /app/
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
 COPY *.py /app/
 
 ARG CLI_ARGS=""

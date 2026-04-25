@@ -13,6 +13,7 @@ import io
 import numpy as np
 import ctranslate2
 from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
 from faster_whisper.vad import get_speech_timestamps, VadOptions
 from typing import Optional, List
 from fastapi import UploadFile, Form, WebSocket, WebSocketDisconnect
@@ -42,6 +43,10 @@ VAD_FILTER_DEFAULT = os.environ.get("WHISPER_VAD", "1") != "0"
 CONDITION_PREV_DEFAULT = os.environ.get("WHISPER_CONDITION_PREV", "0") == "1"
 
 _transcribe_lock = threading.Lock()
+
+# Speaker diarization (pyannote.audio) — lazy-loaded on first diarize=true request
+_diarize_pipeline = None
+_diarize_load_lock = threading.Lock()
 
 # WebSocket streaming defaults (Deepgram-shape /v1/listen)
 WS_SAMPLE_RATE = 16000
@@ -170,10 +175,15 @@ def ensure_model_loaded(requested_model: str = None):
 
 
 def _run_transcribe(audio_bytes: bytes, word_timestamps: bool, fw_kwargs: dict) -> dict:
-    """Run transcription and return a dict compatible with the legacy response builders."""
+    """Run transcription and return a dict compatible with the legacy response builders.
+
+    Decodes audio once into a 16kHz mono float32 array so the same buffer can be reused
+    by diarization without a second PyAV decode pass.
+    """
+    audio_f32 = decode_audio(io.BytesIO(audio_bytes), sampling_rate=16000)
     with _transcribe_lock:
         seg_iter, info = model.transcribe(
-            io.BytesIO(audio_bytes),
+            audio_f32,
             word_timestamps=word_timestamps,
             **fw_kwargs,
         )
@@ -191,7 +201,7 @@ def _run_transcribe(audio_bytes: bytes, word_timestamps: bool, fw_kwargs: dict) 
             for s in segments
         ]
     text = "".join(s.text for s in segments)
-    return {"text": text, "chunks": chunks, "info": info}
+    return {"text": text, "chunks": chunks, "info": info, "audio_f32": audio_f32}
 
 
 def _run_transcribe_array(audio_f32: np.ndarray, fw_kwargs: dict) -> dict:
@@ -210,6 +220,76 @@ def _run_transcribe_array(audio_f32: np.ndarray, fw_kwargs: dict) -> dict:
             chunks.append({"text": s.text, "start": s.start, "end": s.end})
     text = "".join(s.text for s in segments)
     return {"text": text, "chunks": chunks, "info": info}
+
+
+def ensure_diarizer_loaded():
+    """Lazy-load the pyannote speaker diarization pipeline onto the same GPU as whisper."""
+    global _diarize_pipeline
+    if _diarize_pipeline is not None:
+        return
+    with _diarize_load_lock:
+        if _diarize_pipeline is not None:
+            return
+        from pyannote.audio import Pipeline
+        import torch
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        logging.info("Loading pyannote/speaker-diarization-3.1")
+        pipe = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=token,
+        )
+        if pipe is None:
+            raise RuntimeError(
+                "pyannote pipeline returned None — set HF_TOKEN and accept EULAs for "
+                "pyannote/speaker-diarization-3.1 and pyannote/segmentation-3.0"
+            )
+        device_index = model_config[2] if model_config else 0
+        device = "cuda" if (model_config and model_config[0] == "cuda") else "cpu"
+        target = torch.device(f"{device}:{device_index}" if device == "cuda" else "cpu")
+        pipe.to(target)
+        _diarize_pipeline = pipe
+        logging.info(f"pyannote pipeline ready on {target}")
+
+
+def _run_diarize(audio_f32: np.ndarray, min_speakers=None, max_speakers=None) -> list:
+    """Run speaker diarization on a 16kHz mono float32 array.
+
+    Returns a list of {"start", "end", "speaker"} segments where speaker is an int
+    assigned in first-seen order (SPEAKER_00 -> 0, SPEAKER_01 -> 1, ...).
+    """
+    ensure_diarizer_loaded()
+    import torch
+    waveform = torch.from_numpy(audio_f32).unsqueeze(0)  # (1, samples)
+    with _transcribe_lock:                                # share GPU lock with whisper
+        diarization = _diarize_pipeline(
+            {"waveform": waveform, "sample_rate": 16000},
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+        )
+
+    label_to_int = {}
+    out = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        if speaker not in label_to_int:
+            label_to_int[speaker] = len(label_to_int)
+        out.append({
+            "start": float(turn.start),
+            "end": float(turn.end),
+            "speaker": label_to_int[speaker],
+        })
+    return out
+
+
+def _assign_speakers_to_chunks(chunks: list, diar_segments: list) -> None:
+    """Mutate chunks in place; pick the speaker whose turn maximally overlaps each chunk."""
+    for c in chunks:
+        c_start, c_end = c["timestamp"]
+        best_spk, best_overlap = 0, 0.0
+        for ds in diar_segments:
+            ov = max(0.0, min(c_end, ds["end"]) - max(c_start, ds["start"]))
+            if ov > best_overlap:
+                best_overlap, best_spk = ov, ds["speaker"]
+        c["speaker"] = best_spk
 
 
 def _deepgram_event(text, words, start, duration, is_final=True):
@@ -239,12 +319,30 @@ def _deepgram_event(text, words, start, duration, is_final=True):
     }
 
 
-async def whisper(file, response_format: str, word_timestamps: bool, task: str, fw_kwargs: dict):
+async def whisper(file, response_format: str, word_timestamps: bool, task: str, fw_kwargs: dict,
+                  diarize: bool = False, min_speakers=None, max_speakers=None):
+    if diarize and response_format != "verbose_json":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "diarize=true requires response_format=verbose_json"},
+        )
+
     result = _run_transcribe(await file.read(), word_timestamps, fw_kwargs)
 
     filename_noext, ext = os.path.splitext(file.filename)
     info = result["info"]
     chunks = result["chunks"]
+
+    if diarize:
+        try:
+            diar = _run_diarize(result["audio_f32"], min_speakers, max_speakers)
+        except Exception as e:
+            logging.exception("diarization failed")
+            return JSONResponse(
+                status_code=503,
+                content={"error": f"diarization failed: {e}"},
+            )
+        _assign_speakers_to_chunks(chunks, diar)
 
     if response_format == "text":
         return PlainTextResponse(result["text"].strip(), headers={"Content-Disposition": f"attachment; filename={filename_noext}.txt"})
@@ -261,14 +359,24 @@ async def whisper(file, response_format: str, word_timestamps: bool, task: str, 
             "text": result["text"].strip(),
         }
         if word_timestamps:
-            response['words'] = [{'word': c['text'].strip(), 'start': c['timestamp'][0], 'end': c['timestamp'][1] } for c in chunks ]
+            response['words'] = [
+                {
+                    'word': c['text'].strip(),
+                    'start': c['timestamp'][0],
+                    'end': c['timestamp'][1],
+                    **({'speaker': c['speaker']} if 'speaker' in c else {}),
+                } for c in chunks
+            ]
         else:
-            response['segments'] = [{
-                    "id": i,
+            response['segments'] = [
+                {
+                    'id': i,
                     'start': c['timestamp'][0],
                     'end': c['timestamp'][1],
                     'text': c['text'].strip(),
-            } for i, c in enumerate(chunks) ]
+                    **({'speaker': c['speaker']} if 'speaker' in c else {}),
+                } for i, c in enumerate(chunks)
+            ]
 
         return JSONResponse(content=response, media_type="application/json", headers={"Content-Disposition": f"attachment; filename={filename_noext}_verbose.json"})
 
@@ -313,7 +421,10 @@ async def transcriptions(
         prompt: Optional[str] = Form(None),
         response_format: Optional[str] = Form("json"),
         temperature: Optional[float] = Form(None),
-        timestamp_granularities: List[str] = Form(["segment"])
+        timestamp_granularities: List[str] = Form(["segment"]),
+        diarize: Optional[bool] = Form(False),
+        min_speakers: Optional[int] = Form(None),
+        max_speakers: Optional[int] = Form(None),
     ):
     global is_english_only
 
@@ -329,7 +440,8 @@ async def transcriptions(
         timestamp_granularities=timestamp_granularities,
         english_only=is_english_only,
     )
-    return await whisper(file, response_format, word_timestamps, "transcribe", fw_kwargs)
+    return await whisper(file, response_format, word_timestamps, "transcribe", fw_kwargs,
+                         diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers)
 
 
 @app.post("/v1/audio/translations")
@@ -339,6 +451,9 @@ async def translations(
         prompt: Optional[str] = Form(None),
         response_format: Optional[str] = Form("json"),
         temperature: Optional[float] = Form(None),
+        diarize: Optional[bool] = Form(False),
+        min_speakers: Optional[int] = Form(None),
+        max_speakers: Optional[int] = Form(None),
     ):
     global is_english_only
 
@@ -360,7 +475,8 @@ async def translations(
         timestamp_granularities=["segment"],
         english_only=False,
     )
-    return await whisper(file, response_format, word_timestamps, "translate", fw_kwargs)
+    return await whisper(file, response_format, word_timestamps, "translate", fw_kwargs,
+                         diarize=diarize, min_speakers=min_speakers, max_speakers=max_speakers)
 
 
 @app.websocket("/v1/listen")
