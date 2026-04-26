@@ -413,6 +413,13 @@ def _build_fw_kwargs(task, language, prompt, temperature, response_format,
     return k
 
 
+@app.get("/v1/audio/transcriptions/openapi.json", include_in_schema=False)
+async def transcriptions_openapi():
+    """Mirror of /openapi.json reachable through the FQDN, since nginx routes
+    only the /v1/audio/transcriptions prefix to this server."""
+    return app.openapi()
+
+
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
         file: UploadFile,
